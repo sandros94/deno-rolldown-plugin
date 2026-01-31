@@ -39,3 +39,51 @@ be resolved).
    });
    ```
 1. Run `deno task bundle`.
+
+## Advanced Usage
+
+### External Dependencies with Deno Specifiers
+
+By default, dependencies marked as `external` in your Rolldown config will use
+their bare specifiers (e.g., `"chalk"`, `"@std/assert"`). If you want the
+bundled output to use Deno's native `npm:`, `jsr:`, and `https:` import
+specifiers instead, enable the `rewriteExternalSpecifiers` option:
+
+```js
+import denoPlugin from "@deno/rolldown-plugin";
+import { defineConfig } from "rolldown";
+
+export default defineConfig({
+  input: "./main.js",
+  output: {
+    file: "bundle.js",
+  },
+  external: ["chalk", "@std/assert"], // Mark as external
+  plugins: [
+    denoPlugin({
+      rewriteExternalSpecifiers: true, // Rewrite to Deno specifiers
+    }),
+  ],
+});
+```
+
+This will transform imports in the output bundle:
+
+```js
+// Before (bare specifiers):
+import chalk from "chalk";
+import { assertEquals } from "@std/assert";
+
+// After (Deno specifiers):
+import chalk from "npm:chalk@5.6.2";
+import { assertEquals } from "https://jsr.io/@std/assert/1.0.17/mod.ts";
+```
+
+**Benefits:**
+
+- The bundled code can run directly in Deno without additional configuration
+- Explicit version pinning from your deno.lock file
+- Works with npm, JSR, and HTTPS imports
+
+**Note:** Only dependencies marked in the `external` config will be rewritten.
+Bundled dependencies are not affected.

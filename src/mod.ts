@@ -8,6 +8,30 @@ import {
   type WorkspaceOptions,
 } from "@deno/loader";
 import { fromFileUrl } from "@std/path/from-file-url";
+import type { ExternalOption, RolldownOptions } from "rolldown";
+
+interface LoaderGraph {
+  roots: string[];
+  modules: {
+    kind: string;
+    dependencies: {
+      specifier: string;
+      code: {
+        specifier: string;
+        resolutionMode: string;
+        span: {
+          start: { line: number; character: number };
+          end: { line: number; character: number };
+        };
+      };
+    }[];
+    size: number;
+    mediaType: string;
+    specifier: string;
+  }[];
+  redirects: Record<string, string>;
+  packages: Record<string, string>;
+}
 
 interface Module {
   specifier: string;
@@ -16,6 +40,13 @@ interface Module {
 
 /** Options for creating the Deno plugin. */
 export interface DenoPluginOptions extends WorkspaceOptions {
+  /**
+   * When true, rewrites external imports to use Deno-resolved specifiers
+   * (e.g., "chalk" -> "npm:/chalk@5.6.2").
+   * Only applies to dependencies marked as external in Rolldown config.
+   * @default false
+   */
+  rewriteExternalSpecifiers?: boolean;
 }
 
 export interface BuildStartOptions {
@@ -26,8 +57,13 @@ export interface ResolveIdOptions {
   kind: "import-statement" | "dynamic-import" | "require-call";
 }
 
+export interface RenderChunkOptions {
+  format: string;
+}
+
 export interface DenoPlugin extends Disposable {
   name: string;
+  options(options: RolldownOptions): void;
   buildStart(options: BuildStartOptions): Promise<void>;
   resolveId(
     source: string,
@@ -35,6 +71,7 @@ export interface DenoPlugin extends Disposable {
     options: ResolveIdOptions,
   ): Promise<string | { id: string; external: boolean }>;
   load(id: string): string | undefined;
+  renderChunk(code: string, chunk: RenderChunkOptions): { code: string } | null;
 }
 
 /**
@@ -47,11 +84,16 @@ export default function denoPlugin(
   let loader: Loader;
   const loads = new Map<string, Promise<LoadResponse | undefined>>();
   const modules = new Map<string, Module | undefined>();
+  let rolldownExternal: ExternalOption | undefined = undefined;
+  let graph: LoaderGraph | undefined = undefined;
 
   return {
     name: "deno-plugin",
     [Symbol.dispose]() {
       loader?.[Symbol.dispose]();
+    },
+    options(options: RolldownOptions) {
+      rolldownExternal = options.external;
     },
     async buildStart(options: BuildStartOptions) {
       const inputs = Array.isArray(options.input)
@@ -65,6 +107,7 @@ export default function denoPlugin(
       });
       loader = await workspace.createLoader();
       await loader.addEntrypoints(inputs);
+      graph = loader.getGraphUnstable() as LoaderGraph;
     },
     async resolveId(
       source: string,
@@ -121,7 +164,130 @@ export default function denoPlugin(
     load(id: string) {
       return modules.get(id)?.code;
     },
+    renderChunk(code: string) {
+      if (!pluginOptions.rewriteExternalSpecifiers || !graph) return null;
+
+      // Rewrite external imports to use Deno specifiers
+      let modifiedCode = code;
+      const externalMappings = buildExternalMappings(graph, rolldownExternal);
+
+      if (pluginOptions.debug && externalMappings.size > 0) {
+        console.error(
+          "External mappings:",
+          Array.from(externalMappings.entries()),
+        );
+      }
+
+      // Replace import/export statements with Deno specifiers
+      for (const [bareSpecifier, denoSpecifier] of externalMappings) {
+        // Match: import ... from "bareSpecifier" or import ... from 'bareSpecifier'
+        // Also match: export ... from "bareSpecifier"
+        const importRegex = new RegExp(
+          `((?:import|export)(?:[^"']*?)from\\s*["'])${
+            escapeRegExp(bareSpecifier)
+          }(["'])`,
+          "g",
+        );
+        const dynamicImportRegex = new RegExp(
+          `(import\\s*\\(\\s*["'])${escapeRegExp(bareSpecifier)}(["']\\s*\\))`,
+          "g",
+        );
+
+        modifiedCode = modifiedCode.replace(
+          importRegex,
+          `$1${denoSpecifier}$2`,
+        );
+        modifiedCode = modifiedCode.replace(
+          dynamicImportRegex,
+          `$1${denoSpecifier}$2`,
+        );
+      }
+
+      return modifiedCode === code ? null : { code: modifiedCode };
+    },
   };
+}
+
+/**
+ * Builds a map of bare specifiers to their Deno-resolved specifiers.
+ * This is used in renderChunk to rewrite external imports.
+ * Only includes specifiers that match the rolldownExternal configuration.
+ */
+function buildExternalMappings(
+  graph: LoaderGraph,
+  rolldownExternal: ExternalOption | undefined,
+): Map<string, string> {
+  const mappings = new Map<string, string>();
+
+  for (const module of graph.modules) {
+    if (module.kind !== "esm" || !module.dependencies) continue;
+
+    for (const dep of module.dependencies) {
+      if (!dep.code) continue;
+
+      const bareSpecifier = dep.specifier;
+      const denoSpecifier = dep.code.specifier;
+      const resolvedSpecifier = graph.redirects[denoSpecifier] ?? denoSpecifier;
+
+      // Skip if resolvedSpecifier is not a string (importing an unknown package)
+      if (!resolvedSpecifier || typeof resolvedSpecifier !== "string") continue;
+
+      // Only add if it's an npm/jsr/https import AND matches rolldownExternal
+      const isExternalProtocol = resolvedSpecifier.startsWith("npm:") ||
+        resolvedSpecifier.startsWith("jsr:") ||
+        resolvedSpecifier.startsWith("https:");
+
+      if (
+        isExternalProtocol &&
+        isMatchingExternal(bareSpecifier, rolldownExternal)
+      ) {
+        mappings.set(bareSpecifier, resolvedSpecifier);
+      }
+    }
+  }
+
+  return mappings;
+}
+
+/**
+ * Checks if a specifier matches the rolldown external configuration.
+ */
+function isMatchingExternal(
+  specifier: string,
+  external: ExternalOption | undefined,
+): boolean {
+  if (!external) return false;
+
+  // Handle string
+  if (typeof external === "string") {
+    return specifier === external;
+  }
+
+  // Handle RegExp
+  if (external instanceof RegExp) {
+    return external.test(specifier);
+  }
+
+  // Handle function
+  if (typeof external === "function") {
+    // Call the function with minimal required args
+    // Note: We don't have full context here, so we pass what we can
+    return external(specifier, undefined, false) === true;
+  }
+
+  // Handle array
+  if (Array.isArray(external)) {
+    return external.some((ext) => isMatchingExternal(specifier, ext));
+  }
+
+  return false;
+}
+
+/**
+ * Escapes special regex characters in a string.
+ */
+function escapeRegExp(string: string): string {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function mediaTypeToExtension(mediaType: MediaType) {
