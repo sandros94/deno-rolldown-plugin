@@ -232,16 +232,21 @@ function buildExternalMappings(
       // Skip if resolvedSpecifier is not a string (importing an unknown package)
       if (!resolvedSpecifier || typeof resolvedSpecifier !== "string") continue;
 
+      // Deno's loader returns specifiers as canonical URLs
+      const normalizedSpecifier = resolvedSpecifier
+        .replace(/^npm:\//, "npm:")
+        .replace(/^jsr:\//, "jsr:");
+
       // Only add if it's an npm/jsr/https import AND matches rolldownExternal
-      const isExternalProtocol = resolvedSpecifier.startsWith("npm:") ||
-        resolvedSpecifier.startsWith("jsr:") ||
-        resolvedSpecifier.startsWith("https:");
+      const isExternalProtocol = normalizedSpecifier.startsWith("npm:") ||
+        normalizedSpecifier.startsWith("jsr:") ||
+        normalizedSpecifier.startsWith("https:");
 
       if (
         isExternalProtocol &&
         isMatchingExternal(bareSpecifier, rolldownExternal)
       ) {
-        mappings.set(bareSpecifier, resolvedSpecifier);
+        mappings.set(bareSpecifier, normalizedSpecifier);
       }
     }
   }

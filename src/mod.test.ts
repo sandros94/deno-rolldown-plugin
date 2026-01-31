@@ -296,6 +296,44 @@ Deno.test("renderChunk", async (t) => {
 
     await Deno.remove(tempDir, { recursive: true });
   });
+
+  await t.step(
+    "should normalize npm: and jsr: specifiers (remove extra slash)",
+    async () => {
+      const { tempDir, denoJson, testFile } = await prepareFiles({
+        code: 'import chalk from "chalk";\nconsole.log("test");',
+        imports: {
+          "chalk": "npm:chalk@^5.3.0",
+        },
+      });
+
+      using plugin = denoPlugin({
+        rewriteExternalSpecifiers: true,
+        configPath: denoJson,
+      });
+
+      plugin.options({ external: "chalk" });
+      await plugin.buildStart({ input: testFile });
+
+      const inputCode = `import e from"chalk";console.log("test");`;
+      const result = plugin.renderChunk(inputCode, { format: "es" });
+
+      assertEquals(
+        result !== null,
+        true,
+        "Result should not be null when rewriting is enabled",
+      );
+      // Should use npm:package@version (not npm:/package@version)
+      assertStringIncludes(result!.code, "npm:chalk@");
+      assertEquals(
+        result!.code.includes("npm:/"),
+        false,
+        "Should not contain npm:/ (with slash after colon)",
+      );
+
+      await Deno.remove(tempDir, { recursive: true });
+    },
+  );
 });
 
 async function prepareFiles(
